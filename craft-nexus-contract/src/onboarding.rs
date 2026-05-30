@@ -12,6 +12,8 @@ const CURRENT_USER_PROFILE_VERSION: u32 = 4;
 /// Cooldown period for username changes to prevent squatting and rapid identity rotation.
 /// 30 days in seconds.
 const USERNAME_CHANGE_COOLDOWN: u64 = 30 * 24 * 60 * 60;
+/// Maximum verification history entries retained per user (#519).
+const MAX_VERIFICATION_HISTORY: u32 = 10;
 
 #[cfg(test)]
 #[path = "onboarding_test.rs"]
@@ -37,8 +39,13 @@ pub enum DataKey {
     VerificationQueueTail,
     /// Queue index -> address mapping for manual verification requests (#138)
     VerificationQueueIndex(u64),
-    /// Verification history log per user (#63)
+    /// DEPRECATED: Legacy Vec-based verification history (#63).
+    /// Migrated lazily to indexed compact entries (#519).
     VerificationHistory(Address),
+    /// Count of compact verification history entries per user (#519)
+    VerificationHistoryCount(Address),
+    /// Indexed compact verification history entry (#519)
+    VerificationHistoryIndexed(Address, u32),
     /// Username change fee (in stroops) - Issue #114
     UsernameChangeFee,
     /// Token used to collect username change fees (#134)
@@ -49,7 +56,75 @@ pub enum DataKey {
     LastUsernameChange(Address),
 }
 
-use crate::{UserProfile, UserRole, ProfileStatus, LegacyUserProfile};
+/// User roles in the CraftNexus platform
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum UserRole {
+    None = 0,      // User has not onboarded
+    Buyer = 1,     // Can purchase items
+    Artisan = 2,   // Can sell items and create escrow
+    Admin = 3,     // Platform administrator
+    /// Dispute-resolution delegate (Issue #116). Moderators may resolve
+    /// escrows when their address is also registered on the escrow
+    /// contract's platform config, but they cannot change WASM, platform
+    /// fees, or other admin-only settings.
+    Moderator = 4,
+}
+
+/// Profile status for users
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub enum ProfileStatus {
+    Active = 0,
+    Deactivated = 1,
+}
+
+/// Onboarding status for users
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+pub struct UserProfile {
+    pub version: u32,
+    pub address: Address,
+    pub role: UserRole,
+    pub username: String,
+    pub registered_at: u64,
+    pub is_verified: bool,
+    /// Count of escrows where this user was on the winning side (#100)
+    pub successful_trades: u32,
+    /// Count of escrows that ended in a dispute against this user (#100)
+    pub disputed_trades: u32,
+    /// Optional IPFS content identifier for an artisan's portfolio
+    /// showcase (Issue #112).
+    ///
+    /// `None` when unset or after removal via `update_portfolio`. When
+    /// present, the CID must conform to the same validation rules as
+    /// escrow metadata CIDs (see `validate_ipfs_cid`). Indexers can read
+    /// this field from `get_user` / `get_user_by_username` responses or
+    /// subscribe to `PortfolioUpdated` events for live updates.
+    pub portfolio_cid: Option<String>,
+    /// Status of the user profile - Issue #113
+    pub status: ProfileStatus,
+}
+
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+#[cfg_attr(any(test, feature = "testutils"), derive(Debug))]
+struct LegacyUserProfile {
+    pub address: Address,
+    pub role: UserRole,
+    pub username: String,
+    pub registered_at: u64,
+    pub is_verified: bool,
+    /// Count of escrows where this user was on the winning side (#100)
+    pub successful_trades: u32,
+    /// Count of escrows that ended in a dispute against this user (#100)
+    pub disputed_trades: u32,
+    /// Portfolio CID for artisan showcase (IPFS) - Issue #112
+    pub portfolio_cid: Option<String>,
+}
 
 /// Activity metrics used to determine eligibility for auto-verification (#63)
 #[contracttype]
@@ -81,6 +156,27 @@ pub struct VerificationEntry {
     pub action: String,
     /// Address that performed the action (None for auto-verification)
     pub by: Option<Address>,
+}
+
+/// Compact action code for indexed verification history storage (#519).
+#[contracttype]
+#[derive(Copy, Clone, Eq, PartialEq)]
+#[repr(u32)]
+enum VerificationActionCode {
+    Requested = 0,
+    Approved = 1,
+    Rejected = 2,
+    AutoVerified = 3,
+    UsernameChangedRevoked = 4,
+}
+
+/// Lightweight on-chain verification history entry (#519).
+#[contracttype]
+#[derive(Clone, Eq, PartialEq)]
+struct CompactVerificationEntry {
+    timestamp: u64,
+    action: VerificationActionCode,
+    by: Option<Address>,
 }
 
 /// Contract configuration
@@ -306,6 +402,11 @@ fn utf8_char_len(first_byte: u8) -> usize {
 
 /// Validate IPFS CID format (v0 and v1 with multibase prefixes).
 ///
+/// Shared validation logic for portfolio CIDs (Issue #112) and escrow
+/// metadata hashes. Returns `true` when the string is a well-formed CID;
+/// callers should treat `false` as `Error::InvalidPortfolioCid` in
+/// onboarding or the equivalent escrow error in the main contract.
+///
 /// Supports:
 /// - CIDv0: 46-char Base58btc starting with "Qm"
 /// - CIDv1 base32lower (prefix 'b'): lowercase a-z + 2-7
@@ -486,10 +587,137 @@ impl OnboardingContract {
 
     fn read_username_fee_wallet(env: &Env, config: &OnboardingConfig) -> Address {
         let key = DataKey::UsernameChangeFeeWallet;
-        env.storage()
+        let wallet = env
+            .storage()
             .persistent()
             .get(&key)
-            .unwrap_or(config.platform_admin.clone())
+            .unwrap_or(config.platform_admin.clone());
+        if env.storage().persistent().has(&key) {
+            Self::extend_persistent(env, &key);
+        }
+        wallet
+    }
+
+    fn read_user_metrics(env: &Env, address: &Address) -> UserMetrics {
+        let key = DataKey::UserMetrics(address.clone());
+        let metrics = env.storage().persistent().get(&key).unwrap_or(UserMetrics {
+            total_escrow_count: 0,
+            total_volume: 0,
+        });
+        if env.storage().persistent().has(&key) {
+            Self::extend_persistent(env, &key);
+        }
+        metrics
+    }
+
+    fn verification_action_to_string(env: &Env, action: VerificationActionCode) -> String {
+        match action {
+            VerificationActionCode::Requested => String::from_str(env, "requested"),
+            VerificationActionCode::Approved => String::from_str(env, "approved"),
+            VerificationActionCode::Rejected => String::from_str(env, "rejected"),
+            VerificationActionCode::AutoVerified => String::from_str(env, "auto_verified"),
+            VerificationActionCode::UsernameChangedRevoked => {
+                String::from_str(env, "username_changed_revoked")
+            }
+        }
+    }
+
+    fn parse_verification_action(env: &Env, action: &String) -> VerificationActionCode {
+        if action == &String::from_str(env, "requested") {
+            VerificationActionCode::Requested
+        } else if action == &String::from_str(env, "approved") {
+            VerificationActionCode::Approved
+        } else if action == &String::from_str(env, "rejected") {
+            VerificationActionCode::Rejected
+        } else if action == &String::from_str(env, "auto_verified") {
+            VerificationActionCode::AutoVerified
+        } else {
+            VerificationActionCode::UsernameChangedRevoked
+        }
+    }
+
+    fn migrate_legacy_verification_history(env: &Env, user: &Address) {
+        let legacy_key = DataKey::VerificationHistory(user.clone());
+        if !env.storage().persistent().has(&legacy_key) {
+            return;
+        }
+
+        let history: Vec<VerificationEntry> = env
+            .storage()
+            .persistent()
+            .get(&legacy_key)
+            .unwrap_or(Vec::new(env));
+
+        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let mut count: u32 = 0;
+        for i in 0..history.len() {
+            if let Some(entry) = history.get(i) {
+                let compact = CompactVerificationEntry {
+                    timestamp: entry.timestamp,
+                    action: Self::parse_verification_action(env, &entry.action),
+                    by: entry.by.clone(),
+                };
+                let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), i);
+                env.storage().persistent().set(&entry_key, &compact);
+                Self::extend_persistent(env, &entry_key);
+                count = i + 1;
+            }
+        }
+
+        if count > 0 {
+            env.storage().persistent().set(&count_key, &count);
+            Self::extend_persistent(env, &count_key);
+        }
+
+        env.storage().persistent().remove(&legacy_key);
+    }
+
+    fn append_verification_history(
+        env: &Env,
+        user: &Address,
+        action: VerificationActionCode,
+        by: Option<Address>,
+    ) {
+        Self::migrate_legacy_verification_history(env, user);
+
+        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+
+        let slot = if count >= MAX_VERIFICATION_HISTORY {
+            for i in 1..MAX_VERIFICATION_HISTORY {
+                let src_key = DataKey::VerificationHistoryIndexed(user.clone(), i);
+                if let Some(entry) = env
+                    .storage()
+                    .persistent()
+                    .get::<DataKey, CompactVerificationEntry>(&src_key)
+                {
+                    let dst_key = DataKey::VerificationHistoryIndexed(user.clone(), i - 1);
+                    env.storage().persistent().set(&dst_key, &entry);
+                    Self::extend_persistent(env, &dst_key);
+                    env.storage().persistent().remove(&src_key);
+                }
+            }
+            MAX_VERIFICATION_HISTORY - 1
+        } else {
+            count
+        };
+
+        let entry = CompactVerificationEntry {
+            timestamp: env.ledger().timestamp(),
+            action,
+            by,
+        };
+        let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), slot);
+        env.storage().persistent().set(&entry_key, &entry);
+        Self::extend_persistent(env, &entry_key);
+
+        let new_count = if count >= MAX_VERIFICATION_HISTORY {
+            MAX_VERIFICATION_HISTORY
+        } else {
+            count + 1
+        };
+        env.storage().persistent().set(&count_key, &new_count);
+        Self::extend_persistent(env, &count_key);
     }
 
     fn collect_username_change_fee(env: &Env, user: &Address, config: &OnboardingConfig) {
@@ -900,7 +1128,63 @@ impl OnboardingContract {
         }
     }
 
-    /// Assign or update the moderator role for a user (admin only).
+    /// Promote an onboarded user to the `Moderator` role (Issue #116).
+    ///
+    /// Convenience wrapper around `update_user_role` that assigns
+    /// `UserRole::Moderator`. Only the platform admin may call this
+    /// function; the target user does not need to sign.
+    ///
+    /// # Integration notes — issue #517 / component #116
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized (`DataKey::Config` present).
+    /// - Caller must be the configured `platform_admin` (authenticated
+    ///   via `require_auth`).
+    /// - `user` must already be onboarded (`DataKey::UserProfile(user)`).
+    /// - `user` may hold any prior role (`Buyer`, `Artisan`, etc.); there
+    ///   is no self-service path to `Moderator` during `onboard_user`.
+    ///
+    /// ## Storage side-effects
+    /// - Reads and extends TTL on `DataKey::Config`.
+    /// - Reads, writes, and extends TTL on `DataKey::UserProfile(user)`,
+    ///   updating only the `role` field. Profile version
+    ///   (`CURRENT_USER_PROFILE_VERSION`) and all other fields are
+    ///   preserved unchanged.
+    ///
+    /// ## Emitted event — `RoleUpdated`
+    /// - **Topics:** `(Symbol::new("RoleUpdated"),)`
+    /// - **Data:** `(Address, UserRole, UserRole)` — `(user, old_role,
+    ///   UserRole::Moderator)`
+    /// - Indexers should treat this as the canonical signal that a user
+    ///   was promoted to moderator. The event carries both the previous
+    ///   and new role so a role-transition timeline can be reconstructed
+    ///   without a follow-up `get_user` call (Issue #520).
+    ///
+    /// ## Escrow integration
+    /// - Onboarding role assignment alone does **not** authorize dispute
+    ///   resolution on the escrow contract. Operators must also register
+    ///   the moderator's address via the escrow contract's
+    ///   `set_moderator`, which stores it in `PlatformConfig.moderator`.
+    ///   `resolve_dispute` accepts callers matching `config.admin`,
+    ///   `config.moderator`, or `config.arbitrator`.
+    /// - Moderators assigned here cannot invoke admin-only onboarding
+    ///   entrypoints (fee setters, `verify_user`, etc.).
+    ///
+    /// ## Off-chain consumers
+    /// - Use `has_role(user, UserRole::Moderator)` or `get_user_role`
+    ///   for read-only role checks (gas-only, safe for simulation).
+    /// - Prefer subscribing to `RoleUpdated` over polling profile reads.
+    ///
+    /// # Arguments
+    /// * `user` - Address of the onboarded user to promote
+    ///
+    /// # Returns
+    /// Updated `UserProfile` with `role == UserRole::Moderator`.
+    ///
+    /// # Reverts if
+    /// - Contract not initialized
+    /// - Caller is not platform admin
+    /// - User not found
     pub fn set_moderator(env: Env, user: Address) -> UserProfile {
         Self::update_user_role(env, user, UserRole::Moderator)
     }
@@ -1176,6 +1460,7 @@ impl OnboardingContract {
             Self::extend_persistent(&env, &key);
         }
         metrics
+        Self::read_user_metrics(&env, &address)
     }
 
     /// Increment a user's activity metrics (called by the escrow contract).
@@ -1202,11 +1487,7 @@ impl OnboardingContract {
         }
 
         let key = DataKey::UserMetrics(address.clone());
-        let mut metrics: UserMetrics =
-            env.storage().persistent().get(&key).unwrap_or(UserMetrics {
-                total_escrow_count: 0,
-                total_volume: 0,
-            });
+        let mut metrics = Self::read_user_metrics(&env, &address);
 
         metrics.total_escrow_count = metrics
             .total_escrow_count
@@ -1276,23 +1557,12 @@ impl OnboardingContract {
             env.storage().persistent().set(&profile_key, &profile);
             Self::extend_persistent(env, &profile_key);
 
-            // Append auto-verify entry to history
-            let hist_key = DataKey::VerificationHistory(address.clone());
-            let mut history: Vec<VerificationEntry> = env
-                .storage()
-                .persistent()
-                .get(&hist_key)
-                .unwrap_or(Vec::new(env));
-            history.push_back(VerificationEntry {
-                timestamp: env.ledger().timestamp(),
-                action: String::from_str(env, "auto_verified"),
-                by: None,
-            });
-            if history.len() > 10 {
-                history.remove(0);
-            }
-            env.storage().persistent().set(&hist_key, &history);
-            Self::extend_persistent(env, &hist_key);
+            Self::append_verification_history(
+                env,
+                address,
+                VerificationActionCode::AutoVerified,
+                None,
+            );
 
             env.events()
                 .publish((Symbol::new(env, "UserVerified"),), address);
@@ -1369,23 +1639,12 @@ if Self::is_verification_pending(&env, &user) {
 
         Self::enqueue_verification_request(&env, &user);
 
-        // Append to history
-        let hist_key = DataKey::VerificationHistory(user.clone());
-        let mut history: Vec<VerificationEntry> = env
-            .storage()
-            .persistent()
-            .get(&hist_key)
-            .unwrap_or(Vec::new(&env));
-        history.push_back(VerificationEntry {
-            timestamp: env.ledger().timestamp(),
-            action: String::from_str(&env, "requested"),
-            by: Some(user.clone()),
-        });
-        if history.len() > 10 {
-            history.remove(0);
-        }
-        env.storage().persistent().set(&hist_key, &history);
-        Self::extend_persistent(&env, &hist_key);
+        Self::append_verification_history(
+            &env,
+            &user,
+            VerificationActionCode::Requested,
+            Some(user.clone()),
+        );
     }
 
     /// Approve or reject a pending verification request (admin only).
@@ -1416,24 +1675,17 @@ if Self::is_verification_pending(&env, &user) {
 
         Self::clear_verification_request(&env, &user);
 
-        // Append to history
-        let action = if approve { "approved" } else { "rejected" };
-        let hist_key = DataKey::VerificationHistory(user.clone());
-        let mut history: Vec<VerificationEntry> = env
-            .storage()
-            .persistent()
-            .get(&hist_key)
-            .unwrap_or(Vec::new(&env));
-        history.push_back(VerificationEntry {
-            timestamp: env.ledger().timestamp(),
-            action: String::from_str(&env, action),
-            by: Some(config.platform_admin.clone()),
-        });
-        if history.len() > 10 {
-            history.remove(0);
-        }
-        env.storage().persistent().set(&hist_key, &history);
-        Self::extend_persistent(&env, &hist_key);
+        let action = if approve {
+            VerificationActionCode::Approved
+        } else {
+            VerificationActionCode::Rejected
+        };
+        Self::append_verification_history(
+            &env,
+            &user,
+            action,
+            Some(config.platform_admin.clone()),
+        );
 
         if approve {
             env.events()
@@ -1443,11 +1695,32 @@ if Self::is_verification_pending(&env, &user) {
 
     /// Get the full verification history for a user.
     pub fn get_verification_history(env: Env, user: Address) -> Vec<VerificationEntry> {
-        let hist_key = DataKey::VerificationHistory(user.clone());
-        env.storage()
-            .persistent()
-            .get(&hist_key)
-            .unwrap_or(Vec::new(&env))
+        Self::migrate_legacy_verification_history(&env, &user);
+
+        let count_key = DataKey::VerificationHistoryCount(user.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if env.storage().persistent().has(&count_key) {
+            Self::extend_persistent(&env, &count_key);
+        }
+
+        let mut result = Vec::new(&env);
+        for index in 0..count {
+            let entry_key = DataKey::VerificationHistoryIndexed(user.clone(), index);
+            if let Some(compact) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, CompactVerificationEntry>(&entry_key)
+            {
+                result.push_back(VerificationEntry {
+                    timestamp: compact.timestamp,
+                    action: Self::verification_action_to_string(&env, compact.action),
+                    by: compact.by,
+                });
+                Self::extend_persistent(&env, &entry_key);
+            }
+        }
+
+        result
     }
 
     /// Get all addresses currently awaiting manual verification (admin helper).
@@ -1592,11 +1865,11 @@ if Self::is_verification_pending(&env, &user) {
         );
 
         // Enforce cooldown between username changes for the same user.
-        if let Some(last_change) = env
-            .storage()
-            .persistent()
-            .get::<DataKey, u64>(&DataKey::LastUsernameChange(user.clone()))
-        {
+        let cooldown_key = DataKey::LastUsernameChange(user.clone());
+        if let Some(last_change) = env.storage().persistent().get::<DataKey, u64>(&cooldown_key) {
+            if env.storage().persistent().has(&cooldown_key) {
+                Self::extend_persistent(&env, &cooldown_key);
+            }
             let current_time = env.ledger().timestamp();
             assert!(
                 current_time > last_change.saturating_add(USERNAME_CHANGE_COOLDOWN),
@@ -1641,23 +1914,12 @@ if Self::is_verification_pending(&env, &user) {
         );
         Self::extend_persistent(&env, &DataKey::LastUsernameChange(user.clone()));
 
-        // Add history entry for revocation
-        let hist_key = DataKey::VerificationHistory(user.clone());
-        let mut history: Vec<VerificationEntry> = env
-            .storage()
-            .persistent()
-            .get(&hist_key)
-            .unwrap_or(Vec::new(&env));
-        history.push_back(VerificationEntry {
-            timestamp: env.ledger().timestamp(),
-            action: String::from_str(&env, "username_changed_revoked"),
-            by: Some(user.clone()),
-        });
-        if history.len() > 10 {
-            history.remove(0);
-        }
-        env.storage().persistent().set(&hist_key, &history);
-        Self::extend_persistent(&env, &hist_key);
+        Self::append_verification_history(
+            &env,
+            &user,
+            VerificationActionCode::UsernameChangedRevoked,
+            Some(user.clone()),
+        );
 
         // Emit event
         env.events()
@@ -1765,19 +2027,62 @@ if Self::is_verification_pending(&env, &user) {
     // Issue #112 – Artisan Portfolio Verification
     // -----------------------------------------------------------------------
 
-    /// Update an artisan's portfolio CID (Issue #112)
+    /// Update an artisan's portfolio CID (Issue #112).
     ///
-    /// Allows artisans to update their portfolio showcase stored on IPFS.
-    /// Validates the CID format using the same validation as escrow metadata.
+    /// Allows artisans to attach, replace, or remove an IPFS content
+    /// identifier that points to their off-chain portfolio showcase.
+    ///
+    /// # Integration notes — issue #513 / component #112
+    ///
+    /// ## Preconditions
+    /// - Contract must be initialized.
+    /// - `user` must sign the transaction (`user.require_auth()`).
+    /// - `user` must be onboarded with `UserRole::Artisan`. Buyers and
+    ///   other roles cannot update a portfolio.
+    /// - When `portfolio_cid` is `Some(cid)`, `cid` must pass
+    ///   `validate_ipfs_cid` (shared with escrow metadata validation):
+    ///   - **CIDv0:** exactly 46 chars, Base58btc, prefix `Qm`
+    ///   - **CIDv1:** multibase prefix `b` (base32lower), `f`
+    ///     (base16lower), or `z` (base58btc) with version byte `0x01`
+    /// - Pass `None` to clear an existing portfolio link.
+    ///
+    /// ## Storage side-effects
+    /// - Reads, writes, and extends TTL on
+    ///   `DataKey::UserProfile(user)`, updating only
+    ///   `UserProfile.portfolio_cid`. All other profile fields —
+    ///   including `version` (`CURRENT_USER_PROFILE_VERSION`), role,
+    ///   verification status, and reputation counters — are preserved.
+    /// - No username-index or config keys are touched. Storage rent for
+    ///   the profile entry grows only when a non-empty CID string is
+    ///   stored; setting `None` removes the optional payload and reduces
+    ///   entry size.
+    ///
+    /// ## Emitted event — `PortfolioUpdated`
+    /// - **Topics:** `(Symbol::new("PortfolioUpdated"),)`
+    /// - **Data:** `Address` — the `user` whose portfolio changed
+    /// - The event does **not** include the CID itself; indexers should
+    ///   call `get_user(user)` or `get_user_by_username` after observing
+    ///   the event to fetch the updated `portfolio_cid` value.
+    ///
+    /// ## Off-chain consumers
+    /// - Portfolio CIDs are also returned by read-only accessors
+    ///   `get_user` and `get_user_by_username` as part of `UserProfile`.
+    /// - This function performs no token transfers (check-effect-
+    ///   interactions safe: checks and storage writes only).
+    /// - Clients should resolve the CID against IPFS gateways or pinning
+    ///   services off-chain; the contract stores only the identifier.
     ///
     /// # Arguments
-    /// * `user` - User's wallet address
-    /// * `portfolio_cid` - IPFS CID of the portfolio (or None to remove)
+    /// * `user` - Artisan's wallet address (must sign)
+    /// * `portfolio_cid` - IPFS CID to set, or `None` to remove
+    ///
+    /// # Returns
+    /// Updated `UserProfile` reflecting the new `portfolio_cid` value.
     ///
     /// # Reverts if
-    /// - User not onboarded
+    /// - User not onboarded (`Error::UserNotFound`)
     /// - User is not an artisan
-    /// - Invalid CID format (if provided)
+    /// - Invalid CID format when `portfolio_cid` is `Some`
     pub fn update_portfolio(env: Env, user: Address, portfolio_cid: Option<String>) -> UserProfile {
         user.require_auth();
 
