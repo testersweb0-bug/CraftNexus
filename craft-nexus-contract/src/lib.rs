@@ -953,6 +953,17 @@ impl CraftNexusContract {
         }
     }
 
+    /// Validate an optional IPFS CID string, panicking with `InvalidIpfsHash` if present but invalid.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `ipfs_hash` - Optional CID string to validate
+    ///
+    /// # Errors
+    /// Panics with `Error::InvalidIpfsHash` if the CID is present but fails `validate_ipfs_cid`.
+    ///
+    /// # Storage side-effects
+    /// None — this is a pure validation helper with no storage reads or writes.
     fn validate_optional_ipfs_hash(env: &Env, ipfs_hash: &Option<String>) {
         if let Some(cid) = ipfs_hash {
             if !Self::validate_ipfs_cid(cid) {
@@ -961,6 +972,17 @@ impl CraftNexusContract {
         }
     }
 
+    /// Validate an optional metadata hash, panicking with `InvalidMetadataHash` if present but not 32 bytes.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment
+    /// * `metadata_hash` - Optional raw bytes to validate
+    ///
+    /// # Errors
+    /// Panics with `Error::InvalidMetadataHash` if the hash is present but its length is not exactly 32 bytes.
+    ///
+    /// # Storage side-effects
+    /// None — this is a pure validation helper with no storage reads or writes.
     fn validate_optional_metadata_hash(env: &Env, metadata_hash: &Option<Bytes>) {
         if let Some(hash) = metadata_hash {
             if hash.len() != 32 {
@@ -1498,7 +1520,8 @@ impl CraftNexusContract {
         let old_min = config.min_release_window;
         config.min_release_window = min_window;
 
-        env.storage().instance().set(&DataKey::PlatformConfig, &config);
+        env.storage().persistent().set(&DataKey::PlatformConfig, &config);
+        Self::extend_persistent(&env, &DataKey::PlatformConfig);
 
         Self::emit_config_updated(
             &env,

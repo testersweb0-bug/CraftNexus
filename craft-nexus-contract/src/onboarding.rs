@@ -713,7 +713,18 @@ impl OnboardingContract {
             .set(&DataKey::Username(normalized.clone()), &user);
         Self::extend_persistent(&env, &DataKey::Username(normalized.clone()));
 
-        // Emit event
+        // Emit UserOnboarded event.
+        //
+        // Event topic  : `("UserOnboarded",)`
+        // Event payload: `UserOnboardedEvent { user, username, role }`
+        //
+        // Fields:
+        // * `user`     - The wallet address that was just onboarded.
+        // * `username` - The normalized (lowercased, trimmed) username stored on-chain.
+        // * `role`     - The role assigned: `Buyer` (1) or `Artisan` (2).
+        //
+        // Off-chain indexers should subscribe to this event to build user registries
+        // and trigger downstream workflows (e.g. welcome emails, dashboard provisioning).
         env.events().publish(
             (Symbol::new(&env, "UserOnboarded"),),
             UserOnboardedEvent {
@@ -1263,7 +1274,9 @@ impl OnboardingContract {
             "User not found"
         );
 
-        if Self::is_verification_pending(&env, &user) {
+                Self::extend_persistent(&env, &DataKey::UserProfile(user.clone()));
+
+if Self::is_verification_pending(&env, &user) {
             return;
         }
 
