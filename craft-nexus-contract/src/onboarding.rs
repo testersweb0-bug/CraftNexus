@@ -172,7 +172,7 @@ pub struct VerificationEntry {
     pub timestamp: u64,
     /// One of: `"requested"`, `"approved"`, `"rejected"`, `"auto_verified"`,
     /// `"username_changed_revoked"`. See issue #473 / component #72.
-    pub action: String,
+    pub action: Symbol,
     /// Address that performed the action; `None` for auto-verification events.
     pub by: Option<Address>,
 }
@@ -693,14 +693,14 @@ impl OnboardingContract {
     ///
     /// Labels are stable API surface for indexers consuming
     /// [`VerificationEntry::action`] via [`OnboardingContract::get_verification_history`].
-    fn verification_action_to_string(env: &Env, action: VerificationActionCode) -> String {
+   fn verification_action_to_string(env: &Env, action: VerificationActionCode) -> Symbol {
         match action {
-            VerificationActionCode::Requested => String::from_str(env, "requested"),
-            VerificationActionCode::Approved => String::from_str(env, "approved"),
-            VerificationActionCode::Rejected => String::from_str(env, "rejected"),
-            VerificationActionCode::AutoVerified => String::from_str(env, "auto_verified"),
+            VerificationActionCode::Requested => Symbol::new(env, "requested"),
+            VerificationActionCode::Approved => Symbol::new(env, "approved"),
+            VerificationActionCode::Rejected => Symbol::new(env, "rejected"),
+            VerificationActionCode::AutoVerified => Symbol::new(env, "auto_verified"),
             VerificationActionCode::UsernameChangedRevoked => {
-                String::from_str(env, "username_changed_revoked")
+                Symbol::new(env, "username_revoked")
             }
         }
     }
@@ -925,7 +925,7 @@ impl OnboardingContract {
         token_client.transfer(user, &fee_wallet, &fee_amount);
     }
 
-    fn try_get_user_profile(env: &Env, user: Address) -> Option<UserProfile> {
+   fn try_get_user_profile(env: &Env, user: Address) -> Option<UserProfile> {
         let key = DataKey::UserProfile(user.clone());
         let stored: Val = env.storage().persistent().get(&key)?;
         let map = Map::<Symbol, Val>::try_from_val(env, &stored).expect("");
@@ -936,6 +936,10 @@ impl OnboardingContract {
             if profile.version < CURRENT_USER_PROFILE_VERSION {
                 return Some(Self::upgrade_user_profile(env, user, profile));
             }
+            
+            // ---> ADD THIS LINE TO FIX THE TTL BUG <---
+            Self::extend_persistent(env, &key); 
+            
             return Some(profile);
         }
 
@@ -2252,7 +2256,7 @@ impl OnboardingContract {
             .unwrap_or(Vec::new(&env));
         history.push_back(VerificationEntry {
             timestamp: env.ledger().timestamp(),
-            action: String::from_str(&env, "requested"),
+            action: Symbol::new(&env, "requested"),
             by: Some(user.clone()),
         });
         if history.len() > 10 {
@@ -2328,7 +2332,7 @@ impl OnboardingContract {
 
         // Append to history
         let action = if approve {
-            String::from_str(&env, "approved")
+            Symbol::new(&env, "approved")
         } else {
             String::from_str(&env, "rejected")
         };
@@ -2600,7 +2604,7 @@ impl OnboardingContract {
             .unwrap_or(Vec::new(&env));
         history.push_back(VerificationEntry {
             timestamp: env.ledger().timestamp(),
-            action: String::from_str(&env, "username_revoked"),
+            action: Symbol::new(&env, "username_revoked"),
             by: Some(user.clone()),
         });
         if history.len() > 10 {
